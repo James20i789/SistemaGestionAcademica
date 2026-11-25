@@ -1,5 +1,6 @@
 package com.gestionacademico.web;
 
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.Validator;
 import org.springframework.http.ResponseEntity;
@@ -8,11 +9,13 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.io.IOException;
 import java.text.Normalizer;
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 
@@ -56,19 +59,32 @@ class LegacyImport {
                 teachers++;
             }
         }
-        List<Teacher> available = store.teachers();
-        for (Line line : parse("Cursos.txt", input.courses(), 4)) {
+        List<Line> legacyCourses = parse("Cursos.txt", input.courses(), 4);
+        var documents = new HashMap<String, Long>();
+        var normalizedDocuments = new HashMap<String, List<Long>>();
+        var names = new HashMap<String, List<Long>>();
+        if (!legacyCourses.isEmpty()) {
+            for (Teacher teacher : store.teachers()) {
+                documents.put(teacher.document(), teacher.id());
+                normalizedDocuments.computeIfAbsent(normalize(teacher.document()), key -> new ArrayList<>()).add(teacher.id());
+                names.computeIfAbsent(normalize(teacher.firstName() + " " + teacher.lastName()), key -> new ArrayList<>())
+                        .add(teacher.id());
+            }
+        }
+        for (Line line : legacyCourses) {
             String[] f = line.fields;
             if (store.count("SELECT COUNT(*) FROM course WHERE code = ?", f[0].toUpperCase(Locale.ROOT)) > 0) {
                 continue;
             }
-            String legacyTeacher = normalize(f[2]);
-            List<Teacher> candidates = available.stream()
-                    .filter(t -> normalize(t.document()).equals(legacyTeacher)
-                            || normalize(t.firstName() + " " + t.lastName()).equals(legacyTeacher))
-                    .toList();
-            if (candidates.size() != 1) {
-                throw invalid(line.label() + " indica el documento de un profesor registrado en el campo de profesor.");
+            Long teacherId = documents.get(f[2]);
+            if (teacherId == null) {
+                String legacyTeacher = normalize(f[2]);
+                List<Long> candidates = normalizedDocuments.getOrDefault(legacyTeacher,
+                        names.getOrDefault(legacyTeacher, List.of()));
+                if (candidates.size() != 1) {
+                    throw invalid(line.label() + " indica el documento de un profesor registrado en el campo de profesor.");
+                }
+                teacherId = candidates.getFirst();
             }
             int capacity;
             try {
@@ -76,7 +92,7 @@ class LegacyImport {
             } catch (NumberFormatException ex) {
                 throw invalid(line.label() + " ingresa una capacidad numérica.");
             }
-            store.saveCourse(null, verified(line, new CourseForm(f[0], f[1], candidates.getFirst().id(),
+            store.saveCourse(null, verified(line, new CourseForm(f[0], f[1], teacherId,
                     capacity, "Por asignar")));
             courses++;
         }
@@ -86,6 +102,9 @@ class LegacyImport {
             Status status;
             try {
                 date = LocalDate.parse(f[1]);
+                if (date.getYear() < 1 || date.getYear() > 9999) {
+                    throw new IllegalArgumentException();
+                }
                 status = Status.valueOf(normalize(f[2]).toUpperCase(Locale.ROOT));
             } catch (DateTimeParseException | IllegalArgumentException ex) {
                 throw invalid(line.label() + " la fecha o el estado tienen un formato inválido.");
@@ -104,17 +123,19 @@ class LegacyImport {
     }
 
     @GetMapping
-    List<LegacyRow> attendance(@AuthenticationPrincipal Accounts.SessionUser user) {
+    ResponseEntity<List<LegacyRow>> attendance(@AuthenticationPrincipal Accounts.SessionUser user,
+                                               @RequestParam(defaultValue = "1") int page,
+                                               @RequestParam(defaultValue = "100") int size) {
         AcademicApi.admin(user.account());
-        return db.query("SELECT * FROM legacy_attendance ORDER BY on_date DESC, student_name, id",
-                (r, n) -> new LegacyRow(r.getString("student_name"), r.getObject("on_date", LocalDate.class),
-                        Status.valueOf(r.getString("status"))));
+        return AcademicApi.page(store.legacyAttendance(page, size));
     }
 
     @GetMapping("/attendance.csv")
-    ResponseEntity<String> csv(@AuthenticationPrincipal Accounts.SessionUser user) {
-        return AcademicApi.csv("asistencias-historicas.csv", "Fecha,Estudiante,Estado",
-                attendance(user).stream().map(row -> AcademicApi.line(row.date(), row.studentName(), row.status())));
+    void csv(@AuthenticationPrincipal Accounts.SessionUser user, HttpServletResponse response) throws IOException {
+        AcademicApi.admin(user.account());
+        var csv = new CsvExport(response, "asistencias-historicas.csv", "Fecha,Estudiante,Estado");
+        store.exportLegacyAttendance(row -> csv.row(row.date(), row.studentName(), row.status()));
+        csv.flush();
     }
 
     private <T> T verified(Line line, T form) {
@@ -136,6 +157,9 @@ class LegacyImport {
             }
             String[] fields = Arrays.stream(rows[i].split(",", -1)).map(String::strip).toArray(String[]::new);
             var line = new Line(name, i + 1, fields);
+            if (rows[i].indexOf(0) >= 0 || rows[i].indexOf('\uFFFD') >= 0) {
+                throw invalid(line.label() + " revisa la codificación del archivo y guárdalo en UTF-8.");
+            }
             if (fields.length != columns) {
                 throw invalid(line.label() + " se esperaban " + columns + " campos separados por comas.");
             }

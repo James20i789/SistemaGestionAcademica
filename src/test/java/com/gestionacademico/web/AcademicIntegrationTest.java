@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockHttpSession;
@@ -16,6 +17,8 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.time.LocalDate;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
@@ -24,6 +27,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestBuilders.formLogin;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -33,7 +37,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @SpringBootTest(properties = {
         "academia.admin.email=admin@academia.test",
-        "academia.admin.password=clave-admin-de-prueba"
+        "academia.admin.password=clave-admin-de-prueba",
+        "server.forward-headers-strategy=framework"
 })
 @AutoConfigureMockMvc
 class AcademicIntegrationTest {
@@ -66,6 +71,8 @@ class AcademicIntegrationTest {
     @Test
     void requiresSessionAndCsrfAndStoresOnlyPasswordHash() throws Exception {
         mvc.perform(get("/api/students")).andExpect(status().isUnauthorized());
+        mvc.perform(post("/api/students").contentType("application/json").content("{}"))
+                .andExpect(status().isUnauthorized());
         mvc.perform(get("/")).andExpect(status().is3xxRedirection()).andExpect(header().string("Location", endsWith("/login")));
         mvc.perform(get("/login")).andExpect(status().isOk()).andExpect(content().string(containsString("name=\"_csrf\"")));
         mvc.perform(formLogin().user(ADMIN_EMAIL).password("incorrecta")).andExpect(redirectedUrl("/login?error"));
@@ -155,18 +162,24 @@ class AcademicIntegrationTest {
                 Map.of("studentId", second, "status", "AUSENTE"));
         var form = Map.of("courseId", course, "date", date, "marks", marks);
         call(student, HttpMethod.PUT, attendance, form).andExpect(status().isForbidden());
-        call(prof, HttpMethod.PUT, attendance, form).andExpect(status().isNoContent());
-        call(prof, HttpMethod.PUT, attendance, form).andExpect(status().isNoContent());
+        call(prof, HttpMethod.PUT, attendance, form, version(prof, roster + course)).andExpect(status().isNoContent());
+        call(prof, HttpMethod.PUT, attendance, form, version(prof, roster + course)).andExpect(status().isNoContent());
         call(admin, HttpMethod.GET, "/summary", null).andExpect(jsonPath("$.marked").value(2))
                 .andExpect(jsonPath("$.attendancePercent").value(50));
         call(student, HttpMethod.GET, attendance, null).andExpect(jsonPath("$.length()").value(1))
                 .andExpect(jsonPath("$[0].studentName").value("Lucía Prueba"));
         enroll(admin, course, second, false);
         call(prof, HttpMethod.GET, roster + course, null).andExpect(jsonPath("$.length()").value(2));
+        var entries = read(call(prof, HttpMethod.GET, attendance, null));
+        String markVersion = entries.valueStream().filter(row -> row.get("studentId").asLong() == second)
+                .findFirst().orElseThrow().get("version").asText();
         call(prof, HttpMethod.DELETE, attendance + "?courseId=" + course + "&date=" + date + "&studentId=" + second,
-                null).andExpect(status().isNoContent());
+                null, markVersion).andExpect(status().isNoContent());
         call(prof, HttpMethod.GET, attendance, null).andExpect(jsonPath("$.length()").value(1));
-        call(prof, HttpMethod.PUT, attendance, form).andExpect(status().isNoContent());
+        call(prof, HttpMethod.PUT, attendance, form, version(prof, roster + course)).andExpect(status().isNoContent());
+        enroll(admin, course, first, false);
+        call(student, HttpMethod.GET, "/courses", null).andExpect(jsonPath("$.length()").value(0));
+        call(student, HttpMethod.GET, "/attendance/courses", null).andExpect(jsonPath("$[0].id").value(course));
         call(prof, HttpMethod.GET, attendance + ".csv", null)
                 .andExpect(header().string("Content-Disposition", containsString("asistencias.csv")))
                 .andExpect(content().string(containsString("Tomás Prueba")));
@@ -215,15 +228,19 @@ class AcademicIntegrationTest {
                 Map.of("studentId", first, "score", 21), Map.of("studentId", second, "score", 15))))
                 .andExpect(status().isBadRequest());
         call(prof, HttpMethod.PUT, path, Map.of("marks", java.util.List.of(
-                Map.of("studentId", first, "score", 18.75), Map.of("studentId", second, "score", 13))))
+                Map.of("studentId", first, "score", 18.75), Map.of("studentId", second, "score", 13))), version(prof, path))
                 .andExpect(status().isNoContent());
         call(student, HttpMethod.GET, "/grades?from=2026-09-15&to=2026-09-15", null)
                 .andExpect(jsonPath("$.length()").value(1)).andExpect(jsonPath("$[0].score").value(18.75));
         call(student, HttpMethod.GET, "/grades.csv", null)
                 .andExpect(content().string(containsString("'=Evaluación")))
                 .andExpect(content().string(not(containsString("Álvaro"))));
+        enroll(admin, course, first, false);
+        call(student, HttpMethod.GET, "/courses", null).andExpect(jsonPath("$.length()").value(0));
+        call(student, HttpMethod.GET, "/grades/courses", null).andExpect(jsonPath("$[0].id").value(course));
         call(prof, HttpMethod.DELETE, "/assessments/" + assessment, null).andExpect(status().isNoContent());
         call(student, HttpMethod.GET, "/grades", null).andExpect(jsonPath("$.length()").value(0));
+        call(student, HttpMethod.GET, "/grades/courses", null).andExpect(jsonPath("$.length()").value(0));
     }
 
     @Test
@@ -263,6 +280,105 @@ class AcademicIntegrationTest {
         call(admin, HttpMethod.PUT, "/accounts/" + id, Map.of("email", email, "name", "Docente", "role", "TEACHER",
                 "teacherId", teacher, "enabled", false)).andExpect(status().isNoContent());
         call(next, HttpMethod.GET, "/summary", null).andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void rejectsOversizedUtf8PasswordsAsFailedLogin() throws Exception {
+        mvc.perform(formLogin().user(ADMIN_EMAIL).password("ñ".repeat(38)))
+                .andExpect(redirectedUrl("/login?error"));
+        login(ADMIN_EMAIL, ADMIN_PASSWORD);
+    }
+
+    @Test
+    void preventsOutdatedAttendanceEditsAndDeletesInTwoSessions() throws Exception {
+        var admin = admin();
+        var secondSession = admin();
+        long teacher = create(admin, "/teachers", teacher("DOC-R1"));
+        long course = create(admin, "/courses", course("ATT-R1", teacher, 5));
+        long student = create(admin, "/students", student("9991", "Rosa"));
+        enroll(admin, course, student, true);
+        String date = "2026-10-12";
+        String path = "/attendance/roster?courseId=" + course + "&date=" + date;
+        String erase = "/attendance?courseId=" + course + "&date=" + date + "&studentId=" + student;
+        var present = Map.of("courseId", course, "date", date,
+                "marks", List.of(Map.of("studentId", student, "status", "PRESENTE")));
+        var absent = Map.of("courseId", course, "date", date,
+                "marks", List.of(Map.of("studentId", student, "status", "AUSENTE")));
+        String initial = version(admin, path);
+        assertThat(version(secondSession, path)).isEqualTo(initial);
+        call(admin, HttpMethod.GET, path, null).andExpect(header().string("Cache-Control", containsString("no-transform")));
+        call(admin, HttpMethod.PUT, "/attendance", present).andExpect(status().is(428));
+        call(admin, HttpMethod.PUT, "/attendance", present, initial).andExpect(status().isNoContent());
+        call(secondSession, HttpMethod.PUT, "/attendance", absent, initial).andExpect(status().isPreconditionFailed());
+        String oldMark = read(call(admin, HttpMethod.GET, "/attendance", null)).get(0).get("version").asText();
+        call(admin, HttpMethod.PUT, "/attendance", absent, version(admin, path)).andExpect(status().isNoContent());
+        call(secondSession, HttpMethod.DELETE, erase, null, oldMark).andExpect(status().isPreconditionFailed());
+        call(admin, HttpMethod.GET, "/attendance", null).andExpect(jsonPath("$[0].status").value("AUSENTE"));
+    }
+
+    @Test
+    void retainsWithdrawnStudentsWithClearedGradesAndRejectsStaleSaves() throws Exception {
+        var admin = admin();
+        var secondSession = admin();
+        long teacher = create(admin, "/teachers", teacher("DOC-R2"));
+        long course = create(admin, "/courses", course("GRD-R2", teacher, 3));
+        long student = create(admin, "/students", student("9992", "Alicia"));
+        enroll(admin, course, student, true);
+        long assessment = create(admin, "/assessments", Map.of("courseId", course, "title", "Examen", "date", "2026-10-12"));
+        String path = "/assessments/" + assessment + "/grades";
+        String initial = version(secondSession, path);
+        var graded = Map.of("marks", List.of(new AcademicData.GradeMark(student, new java.math.BigDecimal("16.50"))));
+        var cleared = Map.of("marks", List.of(new AcademicData.GradeMark(student, null)));
+        String gradedVersion = call(admin, HttpMethod.PUT, path, graded, initial).andExpect(status().isNoContent())
+                .andReturn().getResponse().getHeader(HttpHeaders.ETAG);
+        call(secondSession, HttpMethod.PUT, path, cleared, initial).andExpect(status().isPreconditionFailed());
+        enroll(admin, course, student, false);
+        String clearedVersion = call(admin, HttpMethod.PUT, path, cleared, gradedVersion).andExpect(status().isNoContent())
+                .andReturn().getResponse().getHeader(HttpHeaders.ETAG);
+        call(admin, HttpMethod.GET, "/grades", null).andExpect(jsonPath("$.length()").value(0));
+        call(admin, HttpMethod.GET, path, null).andExpect(jsonPath("$[0].studentId").value(student))
+                .andExpect(jsonPath("$[0].score").value(nullValue()));
+        call(admin, HttpMethod.PUT, path, graded, clearedVersion).andExpect(status().isNoContent());
+        call(admin, HttpMethod.GET, "/grades", null).andExpect(jsonPath("$[0].score").value(16.5));
+    }
+
+    @Test
+    void paginatesReportsAndExportsAllMatchingRows() throws Exception {
+        var admin = admin();
+        long teacher = create(admin, "/teachers", teacher("DOC-R3"));
+        long course = create(admin, "/courses", course("ATT-R3", teacher, 5));
+        long student = create(admin, "/students", student("9993", "Berta"));
+        enroll(admin, course, student, true);
+        for (int day = 11; day <= 13; day++) {
+            db.update("INSERT INTO attendance (course_id, student_id, on_date, status) VALUES (?, ?, ?, ?)",
+                    course, student, LocalDate.of(2026, 10, day), "PRESENTE");
+        }
+        call(admin, HttpMethod.GET, "/attendance?size=1&page=2", null).andExpect(status().isOk())
+                .andExpect(header().string("X-Has-More", "true"))
+                .andExpect(jsonPath("$.length()").value(1)).andExpect(jsonPath("$[0].date").value("2026-10-12"));
+        call(admin, HttpMethod.GET, "/attendance?size=1&page=3", null)
+                .andExpect(header().string("X-Has-More", "false")).andExpect(jsonPath("$[0].date").value("2026-10-11"));
+        call(admin, HttpMethod.GET, "/attendance?size=201", null).andExpect(status().isBadRequest());
+        call(admin, HttpMethod.GET, "/attendance.csv?from=2026-10-12&to=2026-10-13", null).andExpect(status().isOk())
+                .andExpect(content().string(containsString("2026-10-12")))
+                .andExpect(content().string(containsString("2026-10-13")))
+                .andExpect(content().string(not(containsString("2026-10-11"))));
+        call(admin, HttpMethod.GET, "/attendance.csv?from=2026-10-13&to=2026-10-12", null)
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.message").isString());
+        call(admin, HttpMethod.POST, "/assessments", Map.of("courseId", course, "title", "Fecha inválida", "date", "+10000-01-01"))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void resolvesLegacyTeacherByDocumentBeforeNameAndRejectsCorruptText() throws Exception {
+        var admin = admin();
+        var files = Map.of("teachers", "Ana Brava,Julia,Prueba,Matemáticas,julia@academia.test\n"
+                + "200,Ana,Brava,Ciencias,ana@academia.test", "courses", "IMP-02,Álgebra,Ana Brava,30");
+        call(admin, HttpMethod.POST, "/legacy", files).andExpect(status().isOk()).andExpect(jsonPath("$.courses").value(1));
+        call(admin, HttpMethod.GET, "/courses", null).andExpect(jsonPath("$[0].teacherName").value("Julia Prueba"));
+        call(admin, HttpMethod.POST, "/legacy", Map.of("students", "777,Julia,Prueba,Otro,7-1\n888,Ana,Prue\uFFFDa,Otro,7-1"))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.message", containsString("UTF-8")));
+        call(admin, HttpMethod.GET, "/students", null).andExpect(jsonPath("$.length()").value(0));
     }
 
     private boolean tryEnrollment(long course, long student) {
@@ -320,8 +436,20 @@ class AcademicIntegrationTest {
         return json.readTree(result.andReturn().getResponse().getContentAsByteArray());
     }
 
+    private String version(MockHttpSession session, String path) throws Exception {
+        return call(session, HttpMethod.GET, path, null).andExpect(status().isOk()).andExpect(header().exists(HttpHeaders.ETAG))
+                .andReturn().getResponse().getHeader(HttpHeaders.ETAG);
+    }
+
     private ResultActions call(MockHttpSession session, HttpMethod method, String path, Object data) throws Exception {
+        return call(session, method, path, data, null);
+    }
+
+    private ResultActions call(MockHttpSession session, HttpMethod method, String path, Object data, String version) throws Exception {
         var req = request(method, "/api" + path);
+        if (version != null) {
+            req.header(HttpHeaders.IF_MATCH, version);
+        }
         if (!session.isInvalid()) {
             req.session(session);
         }

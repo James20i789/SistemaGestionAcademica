@@ -11,19 +11,24 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.access.AccessDeniedHandler;
+import org.springframework.security.web.access.AccessDeniedHandlerImpl;
 import org.springframework.security.web.authentication.HttpStatusEntryPoint;
 import org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint;
 import org.springframework.security.web.authentication.logout.SecurityContextLogoutHandler;
 import org.springframework.security.web.context.SecurityContextHolderFilter;
+import org.springframework.security.web.csrf.CsrfException;
 import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
 import org.springframework.security.web.util.matcher.AnyRequestMatcher;
 import org.springframework.security.web.util.matcher.RequestMatcher;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 
 @Configuration
 class WebSecurity {
@@ -31,7 +36,13 @@ class WebSecurity {
     private static final RequestMatcher HOME = PathPatternRequestMatcher.withDefaults().matcher("/");
     @Bean
     PasswordEncoder passwordEncoder() {
-        return new BCryptPasswordEncoder(12);
+        return new BCryptPasswordEncoder(12) {
+            @Override
+            public boolean matches(CharSequence rawPassword, String encodedPassword) {
+                return rawPassword != null && rawPassword.toString().getBytes(StandardCharsets.UTF_8).length <= 72
+                        && super.matches(rawPassword, encodedPassword);
+            }
+        };
     }
 
     @Bean
@@ -45,13 +56,27 @@ class WebSecurity {
                 .exceptionHandling(errors -> errors
                         .defaultAuthenticationEntryPointFor(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED), API)
                         .defaultAuthenticationEntryPointFor(new LoginUrlAuthenticationEntryPoint("/login"),
-                                AnyRequestMatcher.INSTANCE))
+                                AnyRequestMatcher.INSTANCE)
+                        .defaultAccessDeniedHandlerFor(apiAccessDenied(), API))
                 .headers(headers -> headers
                         .frameOptions(frame -> frame.deny())
                         .contentSecurityPolicy(csp -> csp.policyDirectives(
                                 "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")))
                 .addFilterAfter(new AccountSessionFilter(accounts), SecurityContextHolderFilter.class)
                 .build();
+    }
+
+    private static AccessDeniedHandler apiAccessDenied() {
+        var forbidden = new AccessDeniedHandlerImpl();
+        return (request, response, error) -> {
+            var authentication = SecurityContextHolder.getContext().getAuthentication();
+            boolean anonymous = authentication == null || authentication instanceof AnonymousAuthenticationToken;
+            if (error instanceof CsrfException && anonymous) {
+                response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            } else {
+                forbidden.handle(request, response, error);
+            }
+        };
     }
 
     private static final class AccountSessionFilter extends OncePerRequestFilter {

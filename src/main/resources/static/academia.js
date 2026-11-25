@@ -42,7 +42,8 @@ function optionList(entries) {
 
 function field(name, label, settings = {}) {
     const { options, placeholder, value, ...attributes } = settings;
-    const attrs = { name, required: true, ...attributes };
+    const dateRange = attributes.type === 'date' ? { min: '0001-01-01', max: '9999-12-31' } : {};
+    const attrs = { name, required: true, ...dateRange, ...attributes };
     const input = options
         ? node('select', attrs, placeholder == null ? null : node('option', { value: '' }, placeholder),
             options.map(([key, text]) => node('option', { value: key }, text)))
@@ -92,10 +93,11 @@ function query(parameters) {
     return search.size ? '?' + search : '';
 }
 
-async function api(path, method = 'GET', data) {
+async function api(path, method = 'GET', data, { version, details = false } = {}) {
     const headers = {};
     if (method !== 'GET') headers[state.csrfHeader] = state.csrfToken;
     if (data != null) headers['Content-Type'] = 'application/json';
+    if (version != null) headers['If-Match'] = version;
     const response = await fetch('/api' + path, {
         method, headers, body: data == null ? undefined : JSON.stringify(data), cache: 'no-store'
     });
@@ -109,7 +111,9 @@ async function api(path, method = 'GET', data) {
             ? 'Tu cuenta no tiene acceso o la sesión venció. Actualiza la página.'
             : 'Ocurrió un error al comunicarse con el servidor.'));
     }
-    return response.headers.get('Content-Type')?.includes('application/json') ? response.json() : null;
+    const body = response.headers.get('Content-Type')?.includes('application/json') ? await response.json() : null;
+    return details ? { body, version: response.headers.get('ETag'), hasMore: response.headers.get('X-Has-More') === 'true' }
+        : body;
 }
 
 function toast(message) {
@@ -173,7 +177,9 @@ function submitButton(label) {
 
 function editor(title, fields, handler, description) {
     const errors = node('div');
-    const cancel = button('Cancelar', () => dialog.close());
+    const cancel = button('Cancelar', () => {
+        if (!form.querySelector('button[type=submit]').disabled) dialog.close();
+    });
     const form = node('form', { class: 'stack' },
         description ? node('p', { class: 'subtitle' }, description) : null,
         node('div', { class: 'form-grid' }, fields), errors, actions(cancel, submitButton('Guardar')));
@@ -192,13 +198,13 @@ function editRecord(title, definitions, path, row, transform = values) {
     editor(title, definitions, form => api(path + (row ? '/' + row.id : ''), row ? 'PUT' : 'POST', transform(form)));
 }
 
-function deleteButton(path, label, warning) {
+function deleteButton(path, label, warning, version) {
     return button(label, async event => {
         const control = event.currentTarget;
         if (!window.confirm(warning)) return;
         control.disabled = true;
         try {
-            await api(path, 'DELETE');
+            await api(path, 'DELETE', undefined, { version });
             toast('Registro eliminado.');
             await render();
         } catch (error) {
@@ -283,25 +289,35 @@ async function coursesView() {
 async function enrollmentsView() {
     const admin = roleIs('ADMIN');
     const [courses, students] = await Promise.all([api('/courses'), admin ? api('/students') : []]);
-    const selected = state.enrollmentCourse;
     const result = node('div');
-    const select = selectCourse(courses, selected);
-    const refresh = async courseId => {
+    const select = selectCourse(courses, state.enrollmentCourse);
+    const courseSelect = select.querySelector('select');
+    let request = 0;
+    const refresh = async () => {
+        const sequence = ++request;
+        const courseId = courseSelect.value;
         state.enrollmentCourse = courseId;
         if (!courseId) {
             result.replaceChildren(node('p', { class: 'notice' }, 'Selecciona un curso para consultar su matrícula.'));
             return;
         }
+        result.replaceChildren(node('p', { class: 'notice', role: 'status' }, 'Cargando matrícula…'));
         const path = '/courses/' + courseId + '/enrollments';
-        const rows = await api(path);
-        if (courseId !== state.enrollmentCourse) return;
+        let rows;
+        try {
+            rows = await api(path);
+        } catch (error) {
+            if (sequence === request) result.replaceChildren(errorNotice(error));
+            return;
+        }
+        if (sequence !== request) return;
         const already = new Set(rows.map(row => row.studentId));
         const choices = students.filter(student => !already.has(student.id));
         const change = async (id, active) => {
             if (!active && !window.confirm('¿Retirar al estudiante de la matrícula activa? Conserva sus notas y asistencias.')) return;
             await api(path + '/' + id, 'PUT', { active });
             toast(active ? 'Matrícula activa.' : 'Matrícula retirada.');
-            await refresh(courseId);
+            if (courseSelect.value === courseId && courseSelect.isConnected) await refresh();
         };
         const form = node('form', { class: 'filters' });
         const errors = node('div');
@@ -319,10 +335,8 @@ async function enrollmentsView() {
                 event => invoke(event, () => change(row.studentId, !row.active)), row.active ? 'danger' : 'secondary'))] : [])
         ]), 'El curso aún no tiene estudiantes matriculados.'));
     };
-    select.querySelector('select').addEventListener('change', event => {
-        refresh(event.target.value).catch(error => result.replaceChildren(errorNotice(error)));
-    });
-    await refresh(select.querySelector('select').value);
+    courseSelect.addEventListener('change', refresh);
+    await refresh();
     return page('Matrículas', '', [], panel('Curso', select), result);
 }
 
@@ -339,17 +353,33 @@ async function invoke(event, effect) {
 }
 
 async function attendanceView() {
-    const courses = await api('/courses');
+    const view = state.viewVersion;
+    const [courses, { date: today }] = await Promise.all([api('/courses'), api('/summary')]);
+    const suggestedDate = state.attendanceDate && state.attendanceDate !== state.attendanceToday
+        ? state.attendanceDate : today;
+    if (view === state.viewVersion) state.attendanceToday = today;
     const result = node('div');
     const errors = node('div');
     const form = node('form', { class: 'filters' },
         selectCourse(courses, state.attendanceCourse),
-        field('date', 'Fecha', { type: 'date', value: state.attendanceDate || state.today }),
+        field('date', 'Fecha', { type: 'date', value: suggestedDate }),
         submitButton('Cargar lista'));
+    let request = 0;
     const load = async current => {
+        const sequence = ++request;
         const courseId = Number(fieldValue(current, 'courseId'));
         const date = fieldValue(current, 'date');
-        const roster = await api('/attendance/roster' + query({ courseId, date }));
+        result.replaceChildren(node('p', { class: 'notice', role: 'status' }, 'Cargando lista…'));
+        let snapshot;
+        try {
+            snapshot = await api('/attendance/roster' + query({ courseId, date }), 'GET', undefined, { details: true });
+        } catch (error) {
+            if (sequence !== request) return;
+            result.replaceChildren();
+            throw error;
+        }
+        if (sequence !== request || view !== state.viewVersion) return;
+        const roster = snapshot.body;
         state.attendanceCourse = courseId;
         state.attendanceDate = date;
         if (!roster.length) {
@@ -372,37 +402,74 @@ async function attendanceView() {
                 courseId, date, marks: roster.map(row => ({
                     studentId: row.studentId, status: fieldValue(marks, 'mark-' + row.studentId)
                 }))
-            });
-            state.attendanceFilters = { courseId, from: date, to: date };
-            toast('Asistencia guardada.');
-            window.location.hash = 'historial';
+            }, { version: snapshot.version });
+            toast('Asistencia del ' + displayDate(date) + ' guardada.');
+            if (sequence === request && view === state.viewVersion) {
+                state.attendanceFilters = { courseId, from: date, to: date };
+                state.attendancePage = 1;
+                window.location.hash = 'historial';
+            }
         });
-        result.replaceChildren(panel('Lista del ' + displayDate(date), markForm));
+        const course = courses.find(item => item.id === courseId);
+        result.replaceChildren(panel(course.code + ' · ' + course.name + ' · ' + displayDate(date), markForm));
     };
-    form.addEventListener('change', () => result.replaceChildren());
+    form.addEventListener('change', () => {
+        request++;
+        errors.replaceChildren();
+        result.replaceChildren();
+    });
     bindForm(form, errors, load);
     if (fieldValue(form, 'courseId') && fieldValue(form, 'date')) await load(form);
     return page('Pasar lista', '', [], form, errors, result);
 }
 
+function reportPager(pageNumber, hasMore, goToPage) {
+    if (pageNumber === 1 && !hasMore) return null;
+    const previous = button('Anterior', event => invoke(event, () => goToPage(pageNumber - 1)));
+    const next = button('Siguiente', event => invoke(event, () => goToPage(pageNumber + 1)));
+    previous.disabled = pageNumber <= 1;
+    next.disabled = !hasMore;
+    return node('div', { class: 'report-pager actions', role: 'group', 'aria-label': 'Navegación de páginas' },
+        previous, node('span', {}, 'Página ' + pageNumber), next);
+}
+
 async function historyView(grades) {
-    const courses = await api('/courses');
-    const key = grades ? 'gradeFilters' : 'attendanceFilters';
-    const filters = state[key] || {};
+    const view = state.viewVersion;
     const path = grades ? '/grades' : '/attendance';
+    const courses = await api(path + '/courses');
+    const key = grades ? 'gradeFilters' : 'attendanceFilters';
+    const pageKey = grades ? 'gradePage' : 'attendancePage';
+    const filters = state[key] || {};
     const errors = node('div');
     const results = node('div');
+    const navigator = node('div');
+    const pending = node('p', { class: 'notice', hidden: true }, 'Aplica los filtros para actualizar el resultado y la descarga.');
     const form = node('form', { class: 'filters' },
         selectCourse(courses, filters.courseId, true),
         field('from', 'Desde', { type: 'date', required: false, value: filters.from }),
         field('to', 'Hasta', { type: 'date', required: false, value: filters.to }),
         submitButton('Aplicar filtros'));
-    const download = node('a', { class: 'button secondary' }, 'Descargar CSV');
-    const load = async current => {
-        const criteria = values(current);
+    const download = node('a', { class: 'button secondary', hidden: true }, 'Descargar CSV');
+    let applied = '';
+    let request = 0;
+    const syncFilters = () => {
+        pending.hidden = query(values(form)) === applied;
+        download.hidden = !pending.hidden || !download.hasAttribute('href');
+        navigator.hidden = !pending.hidden;
+    };
+    const load = async (criteria, pageNumber) => {
+        const sequence = ++request;
         const suffix = query(criteria);
-        const rows = await api(path + suffix);
+        const { body: rows, hasMore } = await api(path + query({ ...criteria, page: pageNumber }), 'GET',
+            undefined, { details: true });
+        if (sequence !== request || view !== state.viewVersion) return;
+        if (!rows.length && pageNumber > 1) {
+            await load(criteria, 1);
+            return;
+        }
         state[key] = criteria;
+        state[pageKey] = pageNumber;
+        applied = suffix;
         download.href = '/api' + path + '.csv' + suffix;
         const staff = canTeach();
         if (grades) {
@@ -416,13 +483,17 @@ async function historyView(grades) {
                 ...(staff ? [row.studentName] : []), statuses[row.status],
                 ...(staff ? [actions(deleteButton('/attendance' + query({
                     courseId: row.courseId, date: row.date, studentId: row.studentId
-                }), 'Eliminar', '¿Eliminar la marca de asistencia del estudiante para esta fecha?'))] : [])
+                }), 'Eliminar', '¿Eliminar la marca de asistencia del estudiante para esta fecha?', row.version))] : [])
             ])));
         }
+        const pager = reportPager(pageNumber, hasMore, nextPage => load(criteria, nextPage));
+        navigator.replaceChildren(...(pager ? [pager] : []));
+        syncFilters();
     };
-    bindForm(form, errors, load);
-    await load(form);
-    return page(grades ? 'Calificaciones' : 'Historial de asistencia', '', [download], form, errors, results);
+    form.addEventListener('change', syncFilters);
+    bindForm(form, errors, current => load(values(current), 1));
+    await load(values(form), state[pageKey] || 1);
+    return page(grades ? 'Calificaciones' : 'Historial de asistencia', '', [download], form, errors, pending, results, navigator);
 }
 
 async function scheduleView() {
@@ -467,11 +538,22 @@ async function assessmentsView() {
             ...values(form), courseId: row?.courseId || Number(fieldValue(form, 'courseId'))
         }));
     };
+    let request = 0;
     const load = async row => {
+        const sequence = ++request;
         state.assessmentId = row.id;
         const path = '/assessments/' + row.id + '/grades';
-        const roster = await api(path);
-        if (state.assessmentId !== row.id) return;
+        marks.replaceChildren(node('p', { class: 'notice', role: 'status' }, 'Cargando calificaciones…'));
+        let snapshot;
+        try {
+            snapshot = await api(path, 'GET', undefined, { details: true });
+        } catch (error) {
+            if (sequence === request) marks.replaceChildren(errorNotice(error));
+            return;
+        }
+        if (sequence !== request) return;
+        const roster = snapshot.body;
+        let version = snapshot.version;
         if (!roster.length) {
             marks.replaceChildren(panel(row.title, node('p', { class: 'notice' }, 'El curso aún no tiene estudiantes matriculados.')));
             return;
@@ -483,15 +565,17 @@ async function assessmentsView() {
                 person.studentName,
                 node('input', { name: 'grade-' + person.studentId, type: 'number', min: 0, max: 20, step: '0.01',
                     value: person.score, 'aria-label': 'Nota de ' + person.studentName })
-            ])), errors, actions(submitButton('Guardar calificaciones')));
+            ])), errors, actions(button('Volver a cargar', event => invoke(event, () => load(row))),
+                submitButton('Guardar calificaciones')));
         bindForm(form, errors, async current => {
-            await api(path, 'PUT', { marks: roster.map(person => {
+            const saved = await api(path, 'PUT', { marks: roster.map(person => {
                 const score = optional(current, 'grade-' + person.studentId);
                 return { studentId: person.studentId, score: score == null ? null : Number(score) };
-            }) });
+            }) }, { version, details: true });
+            version = saved.version;
             toast('Calificaciones guardadas.');
         });
-        marks.replaceChildren(panel(row.title, form));
+        marks.replaceChildren(panel(roster[0].assessment, form));
     };
     const selectedRow = rows.find(row => row.id === selected);
     if (selectedRow) await load(selectedRow);
@@ -566,7 +650,15 @@ function profileView() {
 }
 
 async function legacyView() {
-    const rows = await api('/legacy');
+    const results = node('div');
+    const load = async pageNumber => {
+        const { body: rows, hasMore } = await api('/legacy' + query({ page: pageNumber }), 'GET', undefined, { details: true });
+        const pager = reportPager(pageNumber, hasMore, load);
+        results.replaceChildren(
+            table(['Fecha', 'Estudiante', 'Estado'], rows.map(row => [displayDate(row.date), row.studentName, statuses[row.status]])),
+            ...(pager ? [pager] : []));
+    };
+    await load(1);
     const errors = node('div');
     const uploads = [['students', 'Estudiantes.txt'], ['teachers', 'Profesor.txt'], ['courses', 'Cursos.txt'],
         ['attendance', 'Asistencias.txt']];
@@ -579,7 +671,13 @@ async function legacyView() {
         for (const [key] of uploads) {
             const file = current.elements.namedItem(key).files[0];
             if (file?.size > 500000) throw new Error('Cada archivo debe pesar como máximo 500 KB.');
-            if (file) files[key] = await file.text();
+            if (file) {
+                try {
+                    files[key] = new TextDecoder('utf-8', { fatal: true }).decode(await file.arrayBuffer());
+                } catch {
+                    throw new Error(file.name + ' contiene bytes inválidos. Guárdalo en UTF-8 antes de importarlo.');
+                }
+            }
         }
         if (Object.keys(files).length === 0) throw new Error('Selecciona al menos un archivo.');
         const result = await api('/legacy', 'POST', files);
@@ -591,7 +689,7 @@ async function legacyView() {
         node('p', { class: 'subtitle' }, 'Usa archivos de texto UTF-8. El archivo de usuarios requiere crear cuentas nuevas.'),
         form), panel('Asistencias históricas sin curso',
         actions(node('a', { href: '/api/legacy/attendance.csv', class: 'button secondary' }, 'Descargar CSV')),
-        table(['Fecha', 'Estudiante', 'Estado'], rows.map(row => [displayDate(row.date), row.studentName, statuses[row.status]]))));
+        results));
 }
 
 function routes() {
@@ -614,10 +712,6 @@ function routes() {
 async function render(focus = false) {
     const pages = routes();
     const requested = window.location.hash.slice(1);
-    if (requested === 'contenido') {
-        content.focus();
-        return;
-    }
     const route = Object.hasOwn(pages, requested) ? requested : 'inicio';
     const version = ++state.viewVersion;
     const [title, load] = pages[route];
@@ -651,6 +745,19 @@ async function start() {
         state.today = data.date;
         document.querySelector('#identity').textContent = state.account.name + ' · ' + roles[state.account.role];
         menuToggle.addEventListener('click', () => setMenu(!sidebar.classList.contains('open')));
+        document.querySelector('.skip-link').addEventListener('click', event => {
+            event.preventDefault();
+            content.focus();
+        });
+        dialog.addEventListener('cancel', event => {
+            if (dialog.querySelector('button[type=submit]:disabled')) event.preventDefault();
+        });
+        navigation.addEventListener('click', event => {
+            if (event.target.closest('a')?.hash === window.location.hash) {
+                setMenu(false);
+                content.focus();
+            }
+        });
         window.addEventListener('hashchange', () => {
             setMenu(false);
             render(true);

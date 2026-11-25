@@ -78,6 +78,7 @@ button:disabled { opacity: .55; cursor: wait; }
 .page-head h1 { font-size: clamp(1.6rem, 3.2vw, 2.3rem); line-height: 1.2; letter-spacing: -.035em; }
 .subtitle { color: var(--muted); font-size: .92rem; margin-top: .35rem; }
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.report-pager { justify-content: flex-end; margin-top: .85rem; }
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: 1rem; }
 .stat, .panel {
     background: var(--surface);

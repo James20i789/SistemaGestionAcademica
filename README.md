@@ -14,7 +14,9 @@ Crea primero el registro del profesor o estudiante y luego vincúlalo a su cuent
 
 La matrícula se limita al cupo del curso. Retirar una matrícula conserva sus asistencias y calificaciones. El sistema detecta cruces de horario por profesor, aula, sección o curso. Las calificaciones usan escala de 0 a 20 y admiten dos decimales.
 
-Para pasar lista, selecciona el curso y la fecha, revisa los estados y guarda. Volver a guardar la misma fecha edita las marcas existentes. La lista que se registró por primera vez queda asociada a esa fecha. Desde **Historial de asistencia** se puede quitar una marca y volver a asignarla desde **Pasar lista**. Los reportes de asistencia y notas se descargan como CSV con los filtros aplicados.
+Para pasar lista, selecciona el curso y la fecha, revisa los estados y guarda. Volver a guardar la misma fecha edita las marcas existentes. La lista que se registró por primera vez queda asociada a esa fecha. Desde **Historial de asistencia** se puede quitar una marca y volver a asignarla desde **Pasar lista**. Los historiales muestran hasta 100 filas por página y los archivos CSV incluyen todos los registros que coinciden con los filtros. Los estudiantes pueden filtrar el historial por cursos de los que se hayan retirado cuando conservan registros allí.
+
+Si otra sesión cambia la asistencia o las notas mientras estás editando, el servidor conserva lo guardado y pide volver a cargar la lista. Una nota vacía de un estudiante retirado se puede volver a editar en la evaluación sin mostrarla como una calificación publicada.
 
 ## Despliegue con Docker Compose
 
@@ -95,6 +97,13 @@ mvn verify
 java -jar target/academia.jar
 ~~~
 
-Para usar PostgreSQL fuera de Compose configura **DATABASE_URL**, **DATABASE_USER** y **DATABASE_PASSWORD**. El servidor escucha en **127.0.0.1:8080** por defecto. Puedes configurar **APP_BIND**, **PORT** y **APP_TIME_ZONE**. Flyway inicializa y versiona el esquema. Spring Security gestiona las sesiones y protege las operaciones de escritura con CSRF.
+Para usar PostgreSQL fuera de Compose configura **DATABASE_URL**, **DATABASE_USER** y **DATABASE_PASSWORD**. El servidor escucha en **127.0.0.1:8080** por defecto. Puedes configurar **APP_BIND**, **PORT** y **APP_TIME_ZONE**. Docker Compose habilita el procesamiento de encabezados reenviados que sanitiza Caddy. Al ejecutar el JAR directamente, habilita **APP_FORWARD_HEADERS_STRATEGY=framework** solo si el proxy de confianza reemplaza esos encabezados y el puerto de la aplicación queda detrás de ese proxy. Flyway inicializa y versiona el esquema. Spring Security gestiona las sesiones y protege las operaciones de escritura con CSRF.
 
 GitHub Actions ejecuta la suite de integración contra H2 y PostgreSQL 17 y arranca los servicios de Docker Compose para verificar el punto de salud a través de Caddy. Las pruebas con PostgreSQL pueden reproducirse en una **base de pruebas dedicada** definiendo **TEST_DATABASE_URL**, **TEST_DATABASE_USER** y **TEST_DATABASE_PASSWORD** antes de ejecutar Maven. La suite vacía las tablas académicas de esa base al iniciar cada caso.
+
+
+### Edición y paginación en la API
+
+Las lecturas de **/api/attendance/roster** y **/api/assessments/{id}/grades** devuelven el encabezado **ETag**. Incluye su valor en **If-Match** al guardar la lista. Para borrar una marca individual de asistencia, usa en **If-Match** el campo **version** de la fila correspondiente del historial. Una escritura sin versión devuelve **428** y una versión anterior devuelve **412**.
+
+Los listados **/api/attendance**, **/api/grades** y **/api/legacy** aceptan **page** y **size**. Las páginas comienzan en 1 y **size** puede ir de 1 a 200, con un valor predeterminado de 100. **X-Has-More** indica si hay otra página. Las descargas de asistencia por curso y de calificaciones aplican los filtros al conjunto completo. El CSV de asistencias antiguas incluye todo su historial. Las fechas admiten años entre 0001 y 9999.

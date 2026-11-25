@@ -1,7 +1,9 @@
 package com.gestionacademico.web;
 
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
 import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -9,10 +11,10 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.web.csrf.CsrfToken;
 import org.springframework.web.bind.annotation.*;
 
+import java.io.IOException;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Stream;
 
 import static com.gestionacademico.web.AcademicData.*;
 import static org.springframework.format.annotation.DateTimeFormat.ISO.DATE;
@@ -141,40 +143,53 @@ class AcademicApi {
     }
 
     @GetMapping("/attendance/roster")
-    List<RosterRow> roster(@AuthenticationPrincipal Accounts.SessionUser user, @RequestParam long courseId,
-                           @RequestParam @DateTimeFormat(iso = DATE) LocalDate date) {
-        return store.attendanceRoster(user.account(), courseId, date);
+    ResponseEntity<List<RosterRow>> roster(@AuthenticationPrincipal Accounts.SessionUser user, @RequestParam long courseId,
+                                         @RequestParam @DateTimeFormat(iso = DATE) LocalDate date) {
+        var snapshot = store.attendanceRoster(user.account(), courseId, date);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore().noTransform()).eTag(snapshot.version()).body(snapshot.rows());
     }
 
     @PutMapping("/attendance")
     @ResponseStatus(HttpStatus.NO_CONTENT)
-    void saveAttendance(@AuthenticationPrincipal Accounts.SessionUser user, @Valid @RequestBody AttendanceForm form) {
-        store.saveAttendance(user.account(), form);
+    void saveAttendance(@AuthenticationPrincipal Accounts.SessionUser user, @Valid @RequestBody AttendanceForm form,
+                        @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String version) {
+        store.saveAttendance(user.account(), form, version);
     }
 
     @DeleteMapping("/attendance")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     void deleteAttendance(@AuthenticationPrincipal Accounts.SessionUser user, @RequestParam long courseId,
-                          @RequestParam long studentId, @RequestParam @DateTimeFormat(iso = DATE) LocalDate date) {
-        store.deleteAttendance(user.account(), courseId, date, studentId);
+                          @RequestParam long studentId, @RequestParam @DateTimeFormat(iso = DATE) LocalDate date,
+                          @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String version) {
+        store.deleteAttendance(user.account(), courseId, date, studentId, version);
     }
 
     @GetMapping("/attendance")
-    List<AttendanceRow> attendance(@AuthenticationPrincipal Accounts.SessionUser user,
-                                   @RequestParam(required = false) Long courseId,
-                                   @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate from,
-                                   @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate to) {
-        return store.attendance(user.account(), courseId, from, to);
+    ResponseEntity<List<AttendanceRow>> attendance(@AuthenticationPrincipal Accounts.SessionUser user,
+                                                   @RequestParam(required = false) Long courseId,
+                                                   @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate from,
+                                                   @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate to,
+                                                   @RequestParam(defaultValue = "1") int page,
+                                                   @RequestParam(defaultValue = "100") int size) {
+        return page(store.attendance(user.account(), courseId, from, to, page, size));
+    }
+
+    @GetMapping("/attendance/courses")
+    List<CourseOption> attendanceCourses(@AuthenticationPrincipal Accounts.SessionUser user) {
+        return store.reportCourses(user.account(), false);
     }
 
     @GetMapping("/attendance.csv")
-    ResponseEntity<String> attendanceCsv(@AuthenticationPrincipal Accounts.SessionUser user,
-                                         @RequestParam(required = false) Long courseId,
-                                         @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate from,
-                                         @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate to) {
-        return csv("asistencias.csv", "Fecha,Código,Curso,Estudiante,Estado",
-                store.attendance(user.account(), courseId, from, to).stream().map(row ->
-                        line(row.date(), row.courseCode(), row.courseName(), row.studentName(), row.status())));
+    void attendanceCsv(@AuthenticationPrincipal Accounts.SessionUser user,
+                       @RequestParam(required = false) Long courseId,
+                       @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate from,
+                       @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate to,
+                       HttpServletResponse response) throws IOException {
+        AcademicStore.checkDates(from, to);
+        var csv = new CsvExport(response, "asistencias.csv", "Fecha,Código,Curso,Estudiante,Estado");
+        store.exportAttendance(user.account(), courseId, from, to, row ->
+                csv.row(row.date(), row.courseCode(), row.courseName(), row.studentName(), row.status()));
+        csv.flush();
     }
 
     @GetMapping("/schedule")
@@ -229,33 +244,44 @@ class AcademicApi {
     }
 
     @GetMapping("/assessments/{id}/grades")
-    List<GradeRow> gradeRoster(@AuthenticationPrincipal Accounts.SessionUser user, @PathVariable long id) {
-        return store.gradeRoster(user.account(), id);
+    ResponseEntity<List<GradeRow>> gradeRoster(@AuthenticationPrincipal Accounts.SessionUser user, @PathVariable long id) {
+        var snapshot = store.gradeRoster(user.account(), id);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore().noTransform()).eTag(snapshot.version()).body(snapshot.rows());
     }
 
     @PutMapping("/assessments/{id}/grades")
-    @ResponseStatus(HttpStatus.NO_CONTENT)
-    void saveGrades(@AuthenticationPrincipal Accounts.SessionUser user, @PathVariable long id,
-                    @Valid @RequestBody GradeForm form) {
-        store.saveGrades(user.account(), id, form);
+    ResponseEntity<Void> saveGrades(@AuthenticationPrincipal Accounts.SessionUser user, @PathVariable long id,
+                                    @Valid @RequestBody GradeForm form,
+                                    @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String version) {
+        return ResponseEntity.noContent().eTag(store.saveGrades(user.account(), id, form, version)).build();
     }
 
     @GetMapping("/grades")
-    List<GradeRow> grades(@AuthenticationPrincipal Accounts.SessionUser user,
-                          @RequestParam(required = false) Long courseId,
-                          @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate from,
-                          @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate to) {
-        return store.grades(user.account(), courseId, from, to);
+    ResponseEntity<List<GradeRow>> grades(@AuthenticationPrincipal Accounts.SessionUser user,
+                                           @RequestParam(required = false) Long courseId,
+                                           @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate from,
+                                           @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate to,
+                                           @RequestParam(defaultValue = "1") int page,
+                                           @RequestParam(defaultValue = "100") int size) {
+        return page(store.grades(user.account(), courseId, from, to, page, size));
+    }
+
+    @GetMapping("/grades/courses")
+    List<CourseOption> gradeCourses(@AuthenticationPrincipal Accounts.SessionUser user) {
+        return store.reportCourses(user.account(), true);
     }
 
     @GetMapping("/grades.csv")
-    ResponseEntity<String> gradesCsv(@AuthenticationPrincipal Accounts.SessionUser user,
-                                     @RequestParam(required = false) Long courseId,
-                                     @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate from,
-                                     @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate to) {
-        return csv("calificaciones.csv", "Fecha,Curso,Evaluación,Estudiante,Nota",
-                store.grades(user.account(), courseId, from, to).stream().map(row ->
-                        line(row.date(), row.courseName(), row.assessment(), row.studentName(), row.score())));
+    void gradesCsv(@AuthenticationPrincipal Accounts.SessionUser user,
+                   @RequestParam(required = false) Long courseId,
+                   @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate from,
+                   @RequestParam(required = false) @DateTimeFormat(iso = DATE) LocalDate to,
+                   HttpServletResponse response) throws IOException {
+        AcademicStore.checkDates(from, to);
+        var csv = new CsvExport(response, "calificaciones.csv", "Fecha,Curso,Evaluación,Estudiante,Nota");
+        store.exportGrades(user.account(), courseId, from, to, row ->
+                csv.row(row.date(), row.courseName(), row.assessment(), row.studentName(), row.score()));
+        csv.flush();
     }
 
     @GetMapping("/accounts")
@@ -285,23 +311,8 @@ class AcademicApi {
         }
     }
 
-    static ResponseEntity<String> csv(String filename, String header, Stream<String> rows) {
-        var document = new StringBuilder("\uFEFF").append(header).append("\r\n");
-        rows.forEach(row -> document.append(row).append("\r\n"));
-        return ResponseEntity.ok().header(HttpHeaders.CONTENT_TYPE, "text/csv; charset=UTF-8")
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
-                .body(document.toString());
-    }
-
-    static String line(Object... values) {
-        return Stream.of(values).map(value -> {
-            String text = value.toString();
-            String stripped = text.stripLeading();
-            if (!stripped.isEmpty() && "=+-@".indexOf(stripped.charAt(0)) >= 0) {
-                text = "'" + text;
-            }
-            return "\"" + text.replace("\"", "\"\"") + "\"";
-        }).collect(java.util.stream.Collectors.joining(","));
+    static <T> ResponseEntity<List<T>> page(Page<T> result) {
+        return ResponseEntity.ok().header("X-Has-More", Boolean.toString(result.hasMore())).body(result.rows());
     }
 
     private static Map<String, Long> id(long id) {

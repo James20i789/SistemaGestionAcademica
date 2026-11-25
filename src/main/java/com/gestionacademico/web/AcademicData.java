@@ -33,10 +33,14 @@ final class AcademicData {
                       @Min(1) @Max(5000) int capacity,
                       @NotBlank @Size(max = 40) String section) {}
 
+    record CourseOption(long id, String code, String name) {}
+    record Page<T>(List<T> rows, boolean hasMore) {}
+    record EditableRoster<T>(List<T> rows, String version) {}
+
     record Enrollment(long studentId, String document, String studentName, String section, boolean active) {}
     record EnrollmentForm(@NotNull Boolean active) {}
     record AttendanceRow(long courseId, String courseCode, String courseName, long studentId, String studentName,
-                         LocalDate date, Status status) {}
+                         LocalDate date, Status status, String version) {}
     record RosterRow(long studentId, String studentName, Status status) {}
     record AttendanceForm(@Positive long courseId, @NotNull LocalDate date,
                           @NotEmpty @Size(max = 5000) List<@NotNull @Valid AttendanceMark> marks) {}
@@ -52,7 +56,7 @@ final class AcademicData {
                           @NotNull LocalDate date) {}
     record GradeRow(long assessmentId, String assessment, long courseId, String courseName, long studentId,
                     String studentName, LocalDate date, BigDecimal score) {}
-    record GradeForm(@NotNull @Size(max = 5000) List<@NotNull @Valid GradeMark> marks) {}
+    record GradeForm(@NotNull List<@NotNull @Valid GradeMark> marks) {}
     record GradeMark(@Positive long studentId,
                      @DecimalMin("0.00") @DecimalMax("20.00") @Digits(integer = 2, fraction = 2) BigDecimal score) {}
 

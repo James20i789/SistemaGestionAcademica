@@ -5,16 +5,22 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 import static com.gestionacademico.web.AcademicData.*;
 import static com.gestionacademico.web.ApiErrors.*;
@@ -178,23 +184,28 @@ class AcademicStore {
         }
     }
 
-    List<RosterRow> attendanceRoster(Account actor, long courseId, LocalDate date) {
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public EditableRoster<RosterRow> attendanceRoster(Account actor, long courseId, LocalDate date) {
+        validateDate(date);
         requireCourseEditor(actor, courseId);
-        return roster(courseId, date);
+        return attendanceSnapshot(courseId, date);
     }
 
     @Transactional
-    public void saveAttendance(Account actor, AttendanceForm form) {
+    public void saveAttendance(Account actor, AttendanceForm form, String version) {
+        validateDate(form.date());
         lock();
         requireCourseEditor(actor, form.courseId());
-        var expected = new HashSet<>(roster(form.courseId(), form.date()).stream().map(RosterRow::studentId).toList());
+        var snapshot = attendanceSnapshot(form.courseId(), form.date());
+        EditVersion.require(version, snapshot.version());
+        var expected = new HashSet<>(snapshot.rows().stream().map(RosterRow::studentId).toList());
         for (AttendanceMark mark : form.marks()) {
             if (!expected.remove(mark.studentId())) {
-                throw conflict("La lista cambió o contiene estudiantes repetidos. Vuelve a cargarla.");
+                throw conflict("La lista contiene estudiantes duplicados o ajenos a esta asistencia.");
             }
         }
         if (!expected.isEmpty()) {
-            throw conflict("Registra un estado para todos los estudiantes de la lista.");
+            throw conflict("Registra un estado para cada estudiante de la lista.");
         }
         db.update("DELETE FROM attendance WHERE course_id = ? AND on_date = ?", form.courseId(), form.date());
         db.batchUpdate("INSERT INTO attendance (course_id, on_date, student_id, status) VALUES (?, ?, ?, ?)",
@@ -203,29 +214,54 @@ class AcademicStore {
     }
 
     @Transactional
-    public void deleteAttendance(Account actor, long courseId, LocalDate date, long studentId) {
+    public void deleteAttendance(Account actor, long courseId, LocalDate date, long studentId, String version) {
+        validateDate(date);
         lock();
         requireCourseEditor(actor, courseId);
+        Status status = db.query("""
+                SELECT status FROM attendance WHERE course_id = ? AND on_date = ? AND student_id = ?
+                    AND status IS NOT NULL
+                """, (r, n) -> Status.valueOf(r.getString("status")), courseId, date, studentId)
+                .stream().findFirst().orElseThrow(ApiErrors::missing);
+        EditVersion.require(version, EditVersion.forAttendanceMark(courseId, date, studentId, status));
         requireUpdated(db.update("""
-                UPDATE attendance SET status = NULL
-                WHERE course_id = ? AND on_date = ? AND student_id = ? AND status IS NOT NULL
+                UPDATE attendance SET status = NULL WHERE course_id = ? AND on_date = ? AND student_id = ?
                 """, courseId, date, studentId));
     }
 
-    List<AttendanceRow> attendance(Account actor, Long courseId, LocalDate from, LocalDate to) {
+    Page<AttendanceRow> attendance(Account actor, Long courseId, LocalDate from, LocalDate to, int page, int size) {
+        return page(attendanceQuery(actor, courseId, from, to), page, size);
+    }
+
+    @Transactional(readOnly = true)
+    public void exportAttendance(Account actor, Long courseId, LocalDate from, LocalDate to, Consumer<AttendanceRow> output) {
+        stream(attendanceQuery(actor, courseId, from, to), output);
+    }
+
+    private ReportQuery<AttendanceRow> attendanceQuery(Account actor, Long courseId, LocalDate from, LocalDate to) {
         checkDates(from, to);
         Scope scope = recordScope(actor, "a");
         var params = new ArrayList<>(scope.values);
         String filters = historyFilters(params, courseId, from, to, "a");
-        return db.query("""
+        String sql = """
                 SELECT c.id AS course_id, c.code, c.name AS course_name, s.id AS student_id,
                     s.first_name || ' ' || s.last_name AS full_name, a.on_date, a.status
                 FROM attendance a JOIN course c ON c.id = a.course_id JOIN student s ON s.id = a.student_id
                 WHERE
-                """ + scope.condition + filters + " AND a.status IS NOT NULL ORDER BY a.on_date DESC, c.code, s.last_name, s.first_name, s.id",
-                (r, n) -> new AttendanceRow(r.getLong("course_id"), r.getString("code"), r.getString("course_name"),
-                        r.getLong("student_id"), r.getString("full_name"), r.getObject("on_date", LocalDate.class),
-                        Status.valueOf(r.getString("status"))), params.toArray());
+                """ + scope.condition + filters + """
+                 AND a.status IS NOT NULL
+                 ORDER BY a.on_date DESC, c.code, s.last_name, s.first_name, s.id
+                """;
+        return new ReportQuery<>(sql, params, AcademicStore::attendanceRow);
+    }
+
+    private static AttendanceRow attendanceRow(ResultSet r, int row) throws SQLException {
+        long courseId = r.getLong("course_id");
+        long studentId = r.getLong("student_id");
+        LocalDate date = r.getObject("on_date", LocalDate.class);
+        Status status = Status.valueOf(r.getString("status"));
+        return new AttendanceRow(courseId, r.getString("code"), r.getString("course_name"), studentId,
+                r.getString("full_name"), date, status, EditVersion.forAttendanceMark(courseId, date, studentId, status));
     }
 
     List<Timeslot> schedule(Account actor) {
@@ -271,6 +307,7 @@ class AcademicStore {
 
     @Transactional
     public long saveAssessment(Account actor, Long id, AssessmentForm f) {
+        validateDate(f.date());
         lock();
         requireCourseEditor(actor, f.courseId());
         if (id == null) {
@@ -295,50 +332,120 @@ class AcademicStore {
         requireUpdated(db.update("DELETE FROM assessment WHERE id = ?", id));
     }
 
-    List<GradeRow> gradeRoster(Account actor, long id) {
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public EditableRoster<GradeRow> gradeRoster(Account actor, long id) {
         Assessment item = assessment(id);
         requireCourseEditor(actor, item.courseId());
-        return gradeRoster(item);
+        return gradeSnapshot(item);
     }
 
     @Transactional
-    public void saveGrades(Account actor, long id, GradeForm form) {
+    public String saveGrades(Account actor, long id, GradeForm form, String version) {
         lock();
         Assessment item = assessment(id);
         requireCourseEditor(actor, item.courseId());
-        var expected = new HashSet<>(gradeRoster(item).stream().map(GradeRow::studentId).toList());
+        var snapshot = gradeSnapshot(item);
+        EditVersion.require(version, snapshot.version());
+        var expected = new HashSet<>(snapshot.rows().stream().map(GradeRow::studentId).toList());
         for (GradeMark mark : form.marks()) {
             if (!expected.remove(mark.studentId())) {
-                throw conflict("La lista cambió o contiene estudiantes repetidos. Vuelve a cargarla.");
+                throw conflict("La lista contiene estudiantes duplicados o ajenos a esta evaluación.");
             }
         }
         if (!expected.isEmpty()) {
-            throw conflict("La lista de estudiantes cambió. Vuelve a cargarla antes de guardar.");
+            throw conflict("Envía una nota o un valor vacío para cada estudiante de la lista.");
         }
         db.update("DELETE FROM grade WHERE assessment_id = ?", id);
-        List<Object[]> scores = form.marks().stream().filter(m -> m.score() != null)
-                .map(m -> new Object[] {id, item.courseId(), m.studentId(), m.score()}).toList();
-        if (!scores.isEmpty()) {
+        if (!form.marks().isEmpty()) {
+            var scores = form.marks().stream().map(m -> new Object[] {id, item.courseId(), m.studentId(), m.score()}).toList();
             db.batchUpdate("INSERT INTO grade (assessment_id, course_id, student_id, score) VALUES (?, ?, ?, ?)", scores);
         }
+        return gradeSnapshot(item).version();
     }
 
-    List<GradeRow> grades(Account actor, Long courseId, LocalDate from, LocalDate to) {
+    Page<GradeRow> grades(Account actor, Long courseId, LocalDate from, LocalDate to, int page, int size) {
+        return page(gradesQuery(actor, courseId, from, to), page, size);
+    }
+
+    @Transactional(readOnly = true)
+    public void exportGrades(Account actor, Long courseId, LocalDate from, LocalDate to, Consumer<GradeRow> output) {
+        stream(gradesQuery(actor, courseId, from, to), output);
+    }
+
+    private ReportQuery<GradeRow> gradesQuery(Account actor, Long courseId, LocalDate from, LocalDate to) {
         checkDates(from, to);
         Scope scope = recordScope(actor, "g");
         var params = new ArrayList<>(scope.values);
         String filters = historyFilters(params, courseId, from, to, "a");
-        return db.query("""
+        String sql = """
                 SELECT a.id, a.course_id, a.title, a.on_date, c.name AS course_name, s.id AS student_id,
                     s.first_name || ' ' || s.last_name AS student_name, g.score
                 FROM grade g JOIN assessment a ON a.id = g.assessment_id JOIN course c ON c.id = a.course_id
                     JOIN student s ON s.id = g.student_id
                 WHERE
-                """ + scope.condition + filters + " ORDER BY a.on_date DESC, c.code, a.id, s.last_name, s.id",
-                AcademicStore::gradeRow, params.toArray());
+                """ + scope.condition + filters + """
+                 AND g.score IS NOT NULL
+                 ORDER BY a.on_date DESC, c.code, a.id, s.last_name, s.id
+                """;
+        return new ReportQuery<>(sql, params, AcademicStore::gradeRow);
     }
 
-    Summary summary(Account actor) {
+    List<CourseOption> reportCourses(Account actor, boolean grades) {
+        Scope scope = courseScope(actor);
+        var params = new ArrayList<>(scope.values);
+        String history = "";
+        if (actor.role() == Role.STUDENT) {
+            history = grades
+                    ? " OR EXISTS (SELECT 1 FROM grade g WHERE g.course_id = c.id AND g.student_id = ? AND g.score IS NOT NULL)"
+                    : " OR EXISTS (SELECT 1 FROM attendance a WHERE a.course_id = c.id AND a.student_id = ? AND a.status IS NOT NULL)";
+            params.add(actor.studentId());
+        }
+        return db.query("SELECT c.id, c.code, c.name FROM course c WHERE (" + scope.condition + history + ") ORDER BY c.code",
+                (r, n) -> new CourseOption(r.getLong("id"), r.getString("code"), r.getString("name")), params.toArray());
+    }
+
+    Page<LegacyRow> legacyAttendance(int page, int size) {
+        return page(legacyQuery(), page, size);
+    }
+
+    @Transactional(readOnly = true)
+    public void exportLegacyAttendance(Consumer<LegacyRow> output) {
+        stream(legacyQuery(), output);
+    }
+
+    private static ReportQuery<LegacyRow> legacyQuery() {
+        return new ReportQuery<>("SELECT * FROM legacy_attendance ORDER BY on_date DESC, student_name, id",
+                List.of(), (r, n) -> new LegacyRow(r.getString("student_name"), r.getObject("on_date", LocalDate.class),
+                        Status.valueOf(r.getString("status"))));
+    }
+
+    private <T> Page<T> page(ReportQuery<T> report, int page, int size) {
+        if (page < 1 || size < 1 || size > 200) {
+            throw invalid("La página debe ser positiva y el tamaño debe estar entre 1 y 200.");
+        }
+        var args = new ArrayList<>(report.parameters());
+        args.add(size + 1);
+        args.add((page - 1L) * size);
+        List<T> rows = db.query(report.sql() + " LIMIT ? OFFSET ?", report.mapper(), args.toArray());
+        boolean hasMore = rows.size() > size;
+        return new Page<>(hasMore ? List.copyOf(rows.subList(0, size)) : rows, hasMore);
+    }
+
+    private <T> void stream(ReportQuery<T> report, Consumer<T> output) {
+        try (var rows = db.queryForStream(connection -> {
+            var statement = connection.prepareStatement(report.sql());
+            statement.setFetchSize(256);
+            for (int i = 0; i < report.parameters().size(); i++) {
+                statement.setObject(i + 1, report.parameters().get(i));
+            }
+            return statement;
+        }, report.mapper())) {
+            rows.forEach(output);
+        }
+    }
+
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+    public Summary summary(Account actor) {
         LocalDate today = LocalDate.now(zone);
         Scope courseScope = courseScope(actor);
         Scope records = recordScope(actor, "a");
@@ -366,31 +473,42 @@ class AcademicStore {
                 figures[0] == 0 ? null : (int) Math.round(100.0 * figures[1] / figures[0]));
     }
 
-    private List<RosterRow> roster(long courseId, LocalDate date) {
-        boolean saved = count("SELECT COUNT(*) FROM attendance WHERE course_id = ? AND on_date = ?", courseId, date) > 0;
-        return db.query("""
+    private EditableRoster<RosterRow> attendanceSnapshot(long courseId, LocalDate date) {
+        List<RosterRow> rows = db.query("""
                 SELECT s.id, s.first_name || ' ' || s.last_name AS student_name, a.status
                 FROM enrollment e JOIN student s ON s.id = e.student_id
                 LEFT JOIN attendance a ON a.course_id = e.course_id AND a.student_id = e.student_id AND a.on_date = ?
-                WHERE e.course_id = ? AND
-                """ + (saved ? " a.student_id IS NOT NULL" : " e.active = TRUE") + " ORDER BY s.last_name, s.first_name, s.id",
-                (r, n) -> new RosterRow(r.getLong("id"), r.getString("student_name"),
-                        r.getString("status") == null ? null : Status.valueOf(r.getString("status"))), date, courseId);
+                WHERE e.course_id = ? AND (a.student_id IS NOT NULL OR (
+                    e.active = TRUE AND NOT EXISTS (SELECT 1 FROM attendance saved
+                        WHERE saved.course_id = e.course_id AND saved.on_date = ?)
+                ))
+                ORDER BY s.last_name, s.first_name, s.id
+                """, (r, n) -> new RosterRow(r.getLong("id"), r.getString("student_name"),
+                        r.getString("status") == null ? null : Status.valueOf(r.getString("status"))), date, courseId, date);
+        String version = EditVersion.forRoster("attendance/" + courseId + "/" + date,
+                rows.stream().sorted(Comparator.comparingLong(RosterRow::studentId))
+                        .map(r -> r.studentId() + ":" + r.status() + ":" + r.studentName()));
+        return new EditableRoster<>(rows, version);
     }
 
-    private List<GradeRow> gradeRoster(Assessment item) {
-        return db.query("""
+    private EditableRoster<GradeRow> gradeSnapshot(Assessment item) {
+        List<GradeRow> rows = db.query("""
                 SELECT a.id, a.course_id, a.title, a.on_date, c.name AS course_name, s.id AS student_id,
                     s.first_name || ' ' || s.last_name AS student_name, g.score
                 FROM assessment a JOIN course c ON c.id = a.course_id JOIN enrollment e ON e.course_id = c.id
                 JOIN student s ON s.id = e.student_id
                 LEFT JOIN grade g ON g.assessment_id = a.id AND g.student_id = s.id
-                WHERE a.id = ? AND (e.active = TRUE OR g.score IS NOT NULL)
+                WHERE a.id = ? AND (e.active = TRUE OR g.student_id IS NOT NULL)
                 ORDER BY s.last_name, s.first_name, s.id
                 """, AcademicStore::gradeRow, item.id());
+        String version = EditVersion.forRoster("grades/" + item.id() + "/" + item.date(),
+                Stream.concat(Stream.of(item.title(), item.courseName()),
+                        rows.stream().sorted(Comparator.comparingLong(GradeRow::studentId))
+                                .map(r -> r.studentId() + ":" + r.score() + ":" + r.studentName())));
+        return new EditableRoster<>(rows, version);
     }
 
-    private static GradeRow gradeRow(java.sql.ResultSet r, int row) throws java.sql.SQLException {
+    private static GradeRow gradeRow(ResultSet r, int row) throws SQLException {
         return new GradeRow(r.getLong("id"), r.getString("title"), r.getLong("course_id"), r.getString("course_name"),
                 r.getLong("student_id"), r.getString("student_name"), r.getObject("on_date", LocalDate.class),
                 r.getBigDecimal("score"));
@@ -399,6 +517,9 @@ class AcademicStore {
     private static String historyFilters(List<Object> values, Long courseId, LocalDate from, LocalDate to, String alias) {
         var filter = new StringBuilder();
         if (courseId != null) {
+            if (courseId <= 0) {
+                throw invalid("Selecciona un curso válido.");
+            }
             filter.append(" AND c.id = ?");
             values.add(courseId);
         }
@@ -413,9 +534,21 @@ class AcademicStore {
         return filter.toString();
     }
 
-    private static void checkDates(LocalDate from, LocalDate to) {
+    static void checkDates(LocalDate from, LocalDate to) {
+        if (from != null) {
+            validateDate(from);
+        }
+        if (to != null) {
+            validateDate(to);
+        }
         if (from != null && to != null && from.isAfter(to)) {
             throw invalid("La fecha inicial debe ser anterior o igual a la final.");
+        }
+    }
+
+    static void validateDate(LocalDate date) {
+        if (date.getYear() < 1 || date.getYear() > 9999) {
+            throw invalid("El año de la fecha debe estar entre 0001 y 9999.");
         }
     }
 
@@ -500,6 +633,8 @@ class AcademicStore {
             throw missing();
         }
     }
+
+    private record ReportQuery<T>(String sql, List<Object> parameters, RowMapper<T> mapper) {}
 
     private record Scope(String condition, List<Object> values) {
         Object[] params() {
