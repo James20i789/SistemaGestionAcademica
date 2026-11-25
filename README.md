@@ -1,6 +1,38 @@
 # Sistema de Gestión Académica
 
-Aplicación web en español para administrar estudiantes, profesores, cursos, matrículas, horarios, asistencias y calificaciones. Los usuarios acceden desde el navegador y trabajan sobre la misma base de datos.
+Aplicación web multiusuario en español para instituciones educativas. Reúne la gestión de estudiantes, profesores, cursos y registros académicos en una base de datos compartida, accesible desde el navegador.
+
+## Objetivo
+
+Facilitar el seguimiento académico desde la matrícula hasta la consulta de asistencias y calificaciones. Cada perfil puede realizar sus tareas y consultar la información que le corresponde.
+
+## Funcionalidades
+
+| Módulo | Qué permite hacer |
+| --- | --- |
+| Panel de inicio | Consultar el total de cursos, estudiantes y profesores, y el porcentaje de asistencia del día según el perfil. |
+| Estudiantes, profesores y cursos | Crear, editar y eliminar registros, asignar docentes y configurar secciones y cupos. |
+| Matrículas y horarios | Matricular o retirar estudiantes, controlar cupos y detectar cruces de horario por profesor, aula, sección o curso. |
+| Asistencias | Pasar lista por curso y fecha, corregir marcas y consultar el historial con filtros. |
+| Evaluaciones y calificaciones | Crear evaluaciones, registrar notas de 0 a 20 y consultar los resultados por curso y fecha. |
+| Reportes e importación | Exportar asistencias y calificaciones a CSV e importar archivos de la versión de escritorio. |
+| Cuentas y permisos | Administrar usuarios y restringir el acceso según su rol y su relación con los cursos. |
+
+## Cambios recientes
+
+- Si otra sesión cambia una asistencia o calificación, el sistema conserva el cambio guardado y pide volver a cargar la lista. La interfaz descarta las respuestas atrasadas al cambiar de curso o fecha. [Correcciones de concurrencia e historiales](https://github.com/James20i789/SistemaGestionAcademica/commit/7e138e1c130e7047ad3143257b88c3c2fadd53f6)
+- Los historiales cargan por páginas y permiten consultar cursos de los que el estudiante se retiró. El CSV incluye todos los resultados de los filtros aplicados.
+- La importación prioriza el documento del profesor y rechaza los archivos con codificación inválida. Si la sesión caduca al guardar, la aplicación vuelve al inicio de sesión.
+- La aplicación pasó de Java Swing a una versión web con PostgreSQL y despliegue mediante Docker Compose. GitHub Actions ejecuta las pruebas en H2 y PostgreSQL y comprueba el arranque de los servicios. [Migración a la web](https://github.com/James20i789/SistemaGestionAcademica/commit/7ab64dc2c9ce3910a7d586b01d6f21a5628d75f8) · [Actualización de GitHub Actions](https://github.com/James20i789/SistemaGestionAcademica/commit/5c579f584b658c7428ae51a77a340f018f13c07e)
+
+## Tecnologías
+
+| Área | Herramientas |
+| --- | --- |
+| Interfaz web | HTML, CSS y JavaScript, con plantillas Thymeleaf. |
+| Servidor y seguridad | Java 21, Spring Boot, API REST y Spring Security. |
+| Datos | PostgreSQL para despliegue, H2 para desarrollo local y Flyway para las migraciones. |
+| Compilación y despliegue | Maven, Docker Compose, Caddy y GitHub Actions. |
 
 ## Perfiles de acceso
 
@@ -82,7 +114,7 @@ Desde la cuenta de administrador, abre **Importación** y elige los archivos de 
 | Archivo | Tratamiento |
 | --- | --- |
 | **Estudiantes.txt** y **Profesor.txt** | Se importan por documento. Si el documento ya existe, se conserva el registro de la aplicación web. |
-| **Cursos.txt** | Se deduplica por código. El campo de profesor debe coincidir con el documento o con un nombre completo único en el padrón. Los cursos se crean con la sección **Por asignar**. Actualiza la sección y registra su matrícula en la aplicación. |
+| **Cursos.txt** | Se deduplica por código. Se busca al profesor primero por documento y, si no coincide, por un nombre completo único en el padrón. Los cursos se crean con la sección **Por asignar**. Actualiza la sección y registra su matrícula en la aplicación. |
 | **Asistencias.txt** | Queda disponible para el administrador como historial sin curso y como CSV. El archivo anterior solo identificaba al estudiante por nombre, así que estos registros se conservan sin asignarles una matrícula. Las filas idénticas se importan una sola vez. |
 | **Usuario.txt** | Crea las cuentas nuevamente desde **Usuarios** con contraseñas nuevas. El formato anterior almacenaba las claves en texto plano. |
 
@@ -101,9 +133,12 @@ Para usar PostgreSQL fuera de Compose configura **DATABASE_URL**, **DATABASE_USE
 
 GitHub Actions ejecuta la suite de integración contra H2 y PostgreSQL 17 y arranca los servicios de Docker Compose para verificar el punto de salud a través de Caddy. Las pruebas con PostgreSQL pueden reproducirse en una **base de pruebas dedicada** definiendo **TEST_DATABASE_URL**, **TEST_DATABASE_USER** y **TEST_DATABASE_PASSWORD** antes de ejecutar Maven. La suite vacía las tablas académicas de esa base al iniciar cada caso.
 
-
 ### Edición y paginación en la API
 
 Las lecturas de **/api/attendance/roster** y **/api/assessments/{id}/grades** devuelven el encabezado **ETag**. Incluye su valor en **If-Match** al guardar la lista. Para borrar una marca individual de asistencia, usa en **If-Match** el campo **version** de la fila correspondiente del historial. Una escritura sin versión devuelve **428** y una versión anterior devuelve **412**.
 
 Los listados **/api/attendance**, **/api/grades** y **/api/legacy** aceptan **page** y **size**. Las páginas comienzan en 1 y **size** puede ir de 1 a 200, con un valor predeterminado de 100. **X-Has-More** indica si hay otra página. Las descargas de asistencia por curso y de calificaciones aplican los filtros al conjunto completo. El CSV de asistencias antiguas incluye todo su historial. Las fechas admiten años entre 0001 y 9999.
+
+## Autor
+
+**James Rios**, programador en desarrollo y responsable de este repositorio. [Perfil de GitHub @James20i789](https://github.com/James20i789)
