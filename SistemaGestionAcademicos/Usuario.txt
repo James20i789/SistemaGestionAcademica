@@ -1,4 +1,0 @@
-Mauricio,mh783639@gmail.com,703010235,Estudiante
-Mauricio,mh783639@gmail.com,703010235,Estudiante
-Mauricio,mn783639@gmail.com,703010235,Admin
-Rafa Solano,rafaSalar123@gmail.com,123456,Docentes

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="es" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Iniciar sesión | Gestión Académica</title>
+    <link rel="stylesheet" href="/academia.css">
+</head>
+<body class="login-page">
+    <main class="login-layout">
+        <section class="login-brand" aria-labelledby="system-name">
+            <div class="brand-mark" aria-hidden="true">A</div>
+            <h1 id="system-name">Gestión<br>Académica</h1>
+        </section>
+        <section class="login-form" aria-labelledby="login-heading">
+            <h2 id="login-heading">Inicia sesión</h2>
+            <p class="notice error" th:if="${param.error}" role="alert">El correo o la contraseña son incorrectos, o la cuenta está desactivada.</p>
+            <p class="notice" th:if="${param.salida}" role="status">La sesión se cerró correctamente.</p>
+            <p class="notice" th:if="${param.clave}" role="status">Contraseña actualizada. Inicia sesión de nuevo.</p>
+            <form th:action="@{/login}" method="post" class="stack">
+                <label>Correo electrónico
+                    <input type="email" name="username" autocomplete="username" required maxlength="254">
+                </label>
+                <label>Contraseña
+                    <input type="password" name="password" autocomplete="current-password" required maxlength="72">
+                </label>
+                <button class="primary" type="submit">Iniciar sesión</button>
+            </form>
+        </section>
+    </main>
+</body>
+</html>

@@ -1,0 +1,67 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: academia
+      POSTGRES_USER: academia
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Completa POSTGRES_PASSWORD en .env}
+    volumes:
+      - school-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "academia", "-d", "academia"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  app:
+    build:
+      context: .
+      args:
+        ARTIFACT_SOURCE: ${APP_ARTIFACT_SOURCE:-compile}
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: jdbc:postgresql://db:5432/academia
+      DATABASE_USER: academia
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Completa POSTGRES_PASSWORD en .env}
+      APP_ADMIN_EMAIL: ${APP_ADMIN_EMAIL:-}
+      APP_ADMIN_PASSWORD: ${APP_ADMIN_PASSWORD:-}
+      APP_SECURE_COOKIE: ${APP_SECURE_COOKIE:-false}
+      APP_TIME_ZONE: ${APP_TIME_ZONE:-America/Lima}
+      APP_BIND: 0.0.0.0
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -Y off -q -O /dev/null http://127.0.0.1:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+      start_period: 20s
+
+  proxy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    environment:
+      NO_PROXY: localhost,127.0.0.1,app,db
+      no_proxy: localhost,127.0.0.1,app,db
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports:
+      - target: 80
+        published: "${HTTP_PORT:-8080}"
+        host_ip: "${LISTEN_IP:-127.0.0.1}"
+      - target: 443
+        published: "${HTTPS_PORT:-443}"
+        host_ip: "${LISTEN_IP:-127.0.0.1}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - school-caddy:/data
+      - school-caddy-config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  school-db:
+  school-caddy:
+  school-caddy-config:

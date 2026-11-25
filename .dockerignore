@@ -1,0 +1,8 @@
+**
+!pom.xml
+!src/
+!src/**
+!Dockerfile
+!target/
+target/*
+!target/academia.jar
